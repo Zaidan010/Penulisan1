@@ -1,27 +1,27 @@
 from collections import defaultdict
 from time import time
-
 import cv2
 import numpy as np
-
 from ultralytics.utils.plotting import Annotator, colors
 
-
 class SpeedEstimator:
-    """A class to estimate the speed of objects in a real-time video stream based on their tracks."""
+    """Estimasi kecepatan kendaraan berdasarkan waktu tempuh antar garis."""
 
-    def __init__(self, names, reg_pts=None, view_img=False, line_thickness=2, spdl_dist_thresh=10):
-        self.reg_pts = reg_pts if reg_pts is not None else [(20, 400), (1260, 400)]
+    def __init__(self, names, view_img=False, line_thickness=2, spdl_dist_thresh=10):
         self.names = names
         self.trk_history = defaultdict(list)
         self.view_img = view_img
         self.tf = line_thickness
+        self.spdl = spdl_dist_thresh  # ambang batas jarak piksel dari garis
         self.spd = {}
         self.trkd_ids = []
-        self.spdl = spdl_dist_thresh
-        self.trk_pt = {}
-        self.trk_pp = {}
-        
+
+        # Dua garis horizontal: start dan end
+        self.start_line = [(20, 300), (1260, 300)]  # warna hijau
+        self.end_line = [(20, 400), (1260, 400)]    # warna merah
+
+        self.trk_pt = {}  # waktu saat melewati start line
+        self.trk_pp = {}  # posisi saat melewati start line
 
     def estimate_speed(self, im0, tracks):
         if not tracks or tracks[0].boxes.id is None:
@@ -31,7 +31,10 @@ class SpeedEstimator:
         clss = tracks[0].boxes.cls.cpu().tolist()
         t_ids = tracks[0].boxes.id.int().cpu().tolist()
         annotator = Annotator(im0, line_width=self.tf)
-        cv2.polylines(im0, [np.array(self.reg_pts, np.int32)], isClosed=True, color=(255, 0, 255), thickness=self.tf * 2)
+
+        # Gambar garis batas
+        cv2.line(im0, self.start_line[0], self.start_line[1], (0, 255, 0), self.tf * 2)   # Hijau
+        cv2.line(im0, self.end_line[0], self.end_line[1], (0, 0, 255), self.tf * 2)       # Merah
 
         for box, t_id, cls in zip(boxes, t_ids, clss):
             track = self.trk_history[t_id]
@@ -42,38 +45,29 @@ class SpeedEstimator:
                 track.pop(0)
 
             trk_pts = np.hstack(track).astype(np.int32).reshape((-1, 1, 2))
+            y = bbox_center[1]
 
-            if t_id not in self.trk_pt:
-                self.trk_pt[t_id] = 0
-
-            speed_label = f"{int(self.spd[t_id])} km/h" if t_id in self.spd else self.names[int(cls)]
+            # Gambar garis lintasan kendaraan
             bbox_color = colors(int(t_id), True)
-
+            speed_label = f"{int(self.spd[t_id])} km/h" if t_id in self.spd else self.names[int(cls)]
             annotator.box_label(box, speed_label, bbox_color)
             cv2.polylines(im0, [trk_pts], isClosed=False, color=bbox_color, thickness=self.tf)
-            cv2.circle(im0, (int(track[-1][0]), int(track[-1][1])), self.tf * 2, bbox_color, -1)
+            cv2.circle(im0, (int(bbox_center[0]), int(bbox_center[1])), self.tf * 2, bbox_color, -1)
 
-            if not self.reg_pts[0][0] < track[-1][0] < self.reg_pts[1][0]:
-                continue
-            if self.reg_pts[1][1] - self.spdl < track[-1][1] < self.reg_pts[1][1] + self.spdl:
-                direction = "known"
-            elif self.reg_pts[0][1] - self.spdl < track[-1][1] < self.reg_pts[0][1] + self.spdl:
-                direction = "known"
-            else:
-                direction = "unknown"
+            # Melewati garis start (hijau)
+            if self.start_line[0][1] - self.spdl < y < self.start_line[0][1] + self.spdl:
+                self.trk_pt[t_id] = time()
+                self.trk_pp[t_id] = bbox_center
 
-            if self.trk_pt.get(t_id) != 0 and direction != "unknown" and t_id not in self.trkd_ids:
-                self.trkd_ids.append(t_id)
-                time_difference = time() - self.trk_pt[t_id]
-                if time_difference > 0:
-                    self.spd[t_id] = np.abs(track[-1][1] - self.trk_pp[t_id][1]) / time_difference
-
-            self.trk_pt[t_id] = time()
-            self.trk_pp[t_id] = track[-1]
-
-        if self.view_img and self.env_check:
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                return
+            # Melewati garis end (merah)
+            if self.end_line[0][1] - self.spdl < y < self.end_line[0][1] + self.spdl:
+                if t_id in self.trk_pt and t_id not in self.trkd_ids:
+                    time_diff = time() - self.trk_pt[t_id]
+                    if time_diff > 0:
+                        pixel_dist = abs(bbox_center[1] - self.trk_pp[t_id][1])
+                        meters_per_pixel = 5 / 100  # konversi kasar: 5 meter = 100 piksel
+                        self.spd[t_id] = (pixel_dist * meters_per_pixel) / time_diff * 3.6  # m/s to km/h
+                        self.trkd_ids.append(t_id)
 
         return im0
 
